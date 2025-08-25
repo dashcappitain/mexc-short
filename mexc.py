@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MEXC Futures Short-Only MA Cross Bot (pymexc)
+MEXC Futures Short-Only MA Cross Bot (pymexc) + Telegram notif
 - TF 5 menit
 - Cross leverage 20x (one-way mode)
 - Open SHORT saat MA5 cross-down MA10
 - Layering 5x: [20, 30, 40, 50, 60] USDT
 - Tambah layer hanya bila harga cross berikutnya > harga layer terakhir
 - API key & secret via .env
-
-Jalankan:
-  python bot.py --symbol BTC_USDT
-  python bot.py --symbol ETH_USDT --dry-run
+- Notifikasi Telegram saat candle M5 close dan terjadi cross-down
 """
 import argparse
 import json
@@ -24,6 +21,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 
 from dotenv import load_dotenv
+import requests
 
 try:
     from pymexc import futures
@@ -62,6 +60,7 @@ def norm_symbol(sym: str) -> str:
         return s.replace("USDT", "_USDT")
     return s
 
+# ------------------ ENV & Telegram ------------------
 def read_env():
     load_dotenv()
     key = os.getenv("MEXC_API_KEY")
@@ -69,7 +68,42 @@ def read_env():
     if not key or not sec:
         print("ENV ERROR: set MEXC_API_KEY dan MEXC_API_SECRET di .env", file=sys.stderr)
         sys.exit(2)
-    return key, sec
+    # Telegram (opsional)
+    tg_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    tg_chat = os.getenv("TELEGRAM_CHAT_ID")
+    return key, sec, tg_token, tg_chat
+
+def tg_enabled(tg_token: Optional[str], tg_chat: Optional[str]) -> bool:
+    return bool(tg_token and tg_chat)
+
+def send_telegram(tg_token: str, tg_chat: str, text: str, parse_mode: str = "Markdown"):
+    """Kirim pesan Telegram; fail-safe agar bot utama tidak berhenti."""
+    try:
+        url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
+        resp = requests.post(url, timeout=10, json={
+            "chat_id": tg_chat,
+            "text": text,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": True,
+        })
+        if resp.status_code != 200:
+            print(f"[WARN][Telegram] HTTP {resp.status_code}: {resp.text}")
+    except Exception as e:
+        print(f"[WARN][Telegram] {e}")
+
+def format_tg(symbol: str, signal_price: float, layer_info: str, layers_opened: int, layer_prices: List[float]) -> str:
+    lines = [
+        f"*M5 Cross-Down* ✅",
+        f"*Symbol:* `{symbol}`",
+        f"*Price:* `{signal_price:.6f}`",
+        f"*Action:* {layer_info}",
+        f"*Layers Opened:* `{layers_opened}`",
+    ]
+    if layer_prices:
+        lp = ", ".join(f"{p:.6f}" for p in layer_prices)
+        lines.append(f"*Layer Prices:* `{lp}`")
+    lines.append(f"_Time: {now_iso()}_")
+    return "\n".join(lines)
 
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
@@ -196,7 +230,7 @@ def qty_from_usdt(notional_usdt: float, price: float, precision: int = 6) -> flo
 
 # ------------------ Main Loop ------------------
 def run(symbol: str, poll_seconds: int, dry_run: bool, state_dir: str):
-    api_key, api_secret = read_env()
+    api_key, api_secret, tg_token, tg_chat = read_env()
     symbol = norm_symbol(symbol)
     ensure_dir(state_dir)
     state_path = os.path.join(state_dir, f"state_{symbol}.json")
@@ -236,8 +270,15 @@ def run(symbol: str, poll_seconds: int, dry_run: bool, state_dir: str):
 
             # Tentukan layer berikutnya
             next_layer = st.layers_opened + 1
+            layer_info = ""
+            performed_action = False
+
             if next_layer > MAX_LAYERS:
-                print(f"[{now_iso()}] {symbol} CROSS-DOWN @ {signal_price:.6f} | Layers full ({st.layers_opened}/{MAX_LAYERS}) -> SKIP")
+                layer_info = f"Skip (layers full {st.layers_opened}/{MAX_LAYERS})"
+                # Kirim notif TELEGRAM untuk cross-down meski full
+                if tg_enabled(tg_token, tg_chat):
+                    send_telegram(tg_token, tg_chat,
+                                  format_tg(symbol, signal_price, layer_info, st.layers_opened, st.layer_prices))
                 st.last_cross_candle_time = signal_ts
                 st.save(state_path)
                 time.sleep(poll_seconds)
@@ -245,7 +286,10 @@ def run(symbol: str, poll_seconds: int, dry_run: bool, state_dir: str):
 
             # Rule layering: hanya tambah jika harga cross baru > harga layer terakhir
             if st.last_layer_price is not None and signal_price <= st.last_layer_price:
-                print(f"[{now_iso()}] {symbol} CROSS-DOWN @ {signal_price:.6f} <= last_layer_price {st.last_layer_price:.6f} -> SKIP add-layer")
+                layer_info = f"Cross-down @ {signal_price:.6f} ⇒ Skip add-layer (signal ≤ last_layer_price {st.last_layer_price:.6f})"
+                if tg_enabled(tg_token, tg_chat):
+                    send_telegram(tg_token, tg_chat,
+                                  format_tg(symbol, signal_price, layer_info, st.layers_opened, st.layer_prices))
                 st.last_cross_candle_time = signal_ts
                 st.save(state_path)
                 time.sleep(poll_seconds)
@@ -256,21 +300,38 @@ def run(symbol: str, poll_seconds: int, dry_run: bool, state_dir: str):
             price_for_qty = signal_price or mx.get_last_price(symbol)
             qty = qty_from_usdt(notional, price_for_qty, precision=6)
 
-            print(f"[{now_iso()}] {symbol} CROSS-DOWN @ {signal_price:.6f} -> OPEN SHORT LAYER-{next_layer} notional={notional}USDT qty≈{qty}")
             if qty <= 0:
-                print(f"[WARN] Qty=0, batal order.")
+                layer_info = f"Qty=0, batal order (notional={notional} USDT)"
+                if tg_enabled(tg_token, tg_chat):
+                    send_telegram(tg_token, tg_chat,
+                                  format_tg(symbol, signal_price, layer_info, st.layers_opened, st.layer_prices))
             else:
+                print(f"[{now_iso()}] {symbol} CROSS-DOWN @ {signal_price:.6f} -> OPEN SHORT LAYER-{next_layer} notional={notional}USDT qty≈{qty}")
                 if not dry_run:
                     oid = f"ma5x10_{symbol}_{signal_ts}_{next_layer}"
-                    resp = mx.market_short(symbol=symbol, qty_base=qty, client_oid=oid)
-                    print(f"[ORDER] Response: {resp}")
+                    try:
+                        resp = mx.market_short(symbol=symbol, qty_base=qty, client_oid=oid)
+                        print(f"[ORDER] Response: {resp}")
+                        layer_info = f"OPEN SHORT Layer-{next_layer} (notional {notional} USDT, qty≈{qty})"
+                        performed_action = True
+                    except Exception as e:
+                        layer_info = f"Order gagal: {e}"
+                        print(f"[ERROR] {e}", file=sys.stderr)
                 else:
                     print("[DRY-RUN] (order tidak dikirim)")
+                    layer_info = f"DRY-RUN: OPEN SHORT Layer-{next_layer} (notional {notional} USDT, qty≈{qty})"
+                    performed_action = True
 
-                # Update state
-                st.layers_opened = next_layer
-                st.last_layer_price = signal_price
-                st.layer_prices.append(signal_price)
+                # Update state jika aksi dilakukan (dry-run/real)
+                if performed_action:
+                    st.layers_opened = next_layer
+                    st.last_layer_price = signal_price
+                    st.layer_prices.append(signal_price)
+
+                # Kirim notif Telegram tentang hasil keputusan
+                if tg_enabled(tg_token, tg_chat):
+                    send_telegram(tg_token, tg_chat,
+                                  format_tg(symbol, signal_price, layer_info, st.layers_opened, st.layer_prices))
 
             st.last_cross_candle_time = signal_ts
             st.save(state_path)
@@ -283,7 +344,7 @@ def run(symbol: str, poll_seconds: int, dry_run: bool, state_dir: str):
         time.sleep(poll_seconds)
 
 def parse_args():
-    p = argparse.ArgumentParser(description="MEXC Futures Short-Only Bot (MA5 cross-down MA10; 5m)")
+    p = argparse.ArgumentParser(description="MEXC Futures Short-Only Bot (MA5 cross-down MA10; 5m) + Telegram notif")
     p.add_argument("--symbol", required=True, help="Contoh: BTC_USDT, ETH_USDT")
     p.add_argument("--poll-seconds", type=int, default=POLL_SECONDS_DEFAULT, help="Interval polling (detik)")
     p.add_argument("--dry-run", action="store_true", help="Hanya log, tidak kirim order")
